@@ -1,0 +1,14 @@
+[Unit]
+Description=Mod player ST7789 display
+After=multi-user.target
+
+[Service]
+ExecStart=/home/hypnoshock/mod_player/.venv/bin/python /home/hypnoshock/mod_player/mod_display.py
+Restart=always
+RestartSec=2
+User=hypnoshock
+Group=hypnoshock
+SupplementaryGroups=spi gpio
+
+[Install]
+WantedBy=multi-user.target
