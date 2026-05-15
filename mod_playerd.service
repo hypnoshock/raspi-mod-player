@@ -1,0 +1,15 @@
+[Unit]
+Description=Mod player daemon (libopenmpt direct)
+After=sound.target
+
+[Service]
+Type=simple
+User=hypnoshock
+Group=hypnoshock
+SupplementaryGroups=audio gpio
+ExecStart=/home/hypnoshock/mod_player/.venv/bin/python /home/hypnoshock/mod_player/mod_playerd.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

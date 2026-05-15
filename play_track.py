@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
-"""Wrap `xmp -R FILE` so the current playback state is published to
-/tmp/mod_state.json for the display daemon to render.
+"""Wrap a single `xmp -R --loop-all FILES...` invocation so its UI still
+renders to the screen session and button keystrokes still reach it,
+while parsing xmp's output to publish per-track state at
+/tmp/mod_state.json.
 
-xmp runs inside a pseudo-tty; the wrapper fans output back to the
-real terminal (so xmp's UI still appears in the screen session),
-forwards stdin keypresses to xmp (so the GPIO button -> UInput
-keystrokes keep working), and parses the header for title/format/
-duration to write into the state file.
+This is intentionally a single xmp instance handling its own playlist:
+xmp owns navigation (n/p/q/arrow keys) so the GPIO -> UInput buttons
+work exactly as they did before the display feature existed. The wrapper
+only observes xmp's output — it never spawns multiple xmp processes.
+
+State file format:
+
+    {
+      "file":        "/path/to/track.mod",
+      "title":       "boost",
+      "format":      "Protracker M.K.",
+      "duration_s":  317,
+      "started_at":  1715432104.31
+    }
+
+`started_at` is reset whenever xmp prints a fresh `Loading <file> (N of M)`
+line, so the display's wall-clock progress bar stays aligned with track
+changes (including user-initiated next/prev jumps).
 """
 import errno
 import fcntl
@@ -20,8 +35,9 @@ import termios
 import time
 
 STATE_PATH = '/tmp/mod_state.json'
-PARSE_BUF_MAX = 8192
+PARSE_BUF_MAX = 16384
 
+LOAD_RE = re.compile(rb'^\s*Loading\s+(.+?)\s+\(\d+\s+of\s+\d+\)\s*\r?$', re.M)
 TITLE_RE = re.compile(rb'^\s*Module name\s*:\s*(.+?)\r?$', re.M)
 TYPE_RE = re.compile(rb'^\s*Module type\s*:\s*(.+?)\r?$', re.M)
 DUR_RE = re.compile(rb'^\s*Duration\s*:\s*(\d+)min(\d+)s', re.M)
@@ -39,12 +55,12 @@ def write_state(state):
 
 def main():
     if len(sys.argv) < 2:
-        print('usage: play_track.py FILE', file=sys.stderr)
+        sys.stderr.write('usage: play_track.py FILE [FILE...]\n')
         sys.exit(2)
-    filename = sys.argv[1]
+    files = sys.argv[1:]
 
     state = {
-        'file': filename,
+        'file': files[0],
         'title': None,
         'format': None,
         'duration_s': None,
@@ -63,7 +79,7 @@ def main():
     pid, master_fd = pty.fork()
     if pid == 0:
         try:
-            os.execvp('xmp', ['xmp', '-R', filename])
+            os.execvp('xmp', ['xmp', '-R', '--loop-all', *files])
         except OSError as e:
             sys.stderr.write(f'failed to exec xmp: {e}\n')
             os._exit(127)
@@ -87,13 +103,25 @@ def main():
 
     stdout_fd = 1
     parse_buf = bytearray()
-    saw_all = False
-    child_done = False
+    # Track which file is currently being parsed so we know when the next
+    # Module name/type/Duration lines belong to a different track.
+    current_file = files[0]
+
+    def reset_for_new_track(new_file):
+        nonlocal current_file
+        current_file = new_file
+        state['file'] = new_file
+        state['title'] = None
+        state['format'] = None
+        state['duration_s'] = None
+        state['started_at'] = time.time()
+        write_state(state)
 
     poll_fds = [master_fd]
     if stdin_fd >= 0:
         poll_fds.append(stdin_fd)
 
+    child_done = False
     try:
         while not child_done:
             try:
@@ -119,40 +147,44 @@ def main():
                     os.write(stdout_fd, data)
                 except OSError:
                     pass
-                if not saw_all:
-                    parse_buf.extend(data)
-                    if len(parse_buf) > PARSE_BUF_MAX:
-                        del parse_buf[: len(parse_buf) - PARSE_BUF_MAX]
-                    changed = False
-                    if state['title'] is None:
-                        m = TITLE_RE.search(parse_buf)
-                        if m:
-                            state['title'] = m.group(1).decode(
-                                'utf-8', 'replace'
-                            ).strip()
-                            changed = True
-                    if state['format'] is None:
-                        m = TYPE_RE.search(parse_buf)
-                        if m:
-                            state['format'] = m.group(1).decode(
-                                'utf-8', 'replace'
-                            ).strip()
-                            changed = True
-                    if state['duration_s'] is None:
-                        m = DUR_RE.search(parse_buf)
-                        if m:
-                            state['duration_s'] = (
-                                int(m.group(1)) * 60 + int(m.group(2))
-                            )
-                            changed = True
-                    if changed:
-                        write_state(state)
-                    if (
-                        state['title']
-                        and state['format']
-                        and state['duration_s']
-                    ):
-                        saw_all = True
+
+                parse_buf.extend(data)
+                if len(parse_buf) > PARSE_BUF_MAX:
+                    del parse_buf[: len(parse_buf) - PARSE_BUF_MAX]
+
+                # Track changes — process from oldest to newest so we don't
+                # miss any if multiple Loading lines arrive in one chunk.
+                changed = False
+                last_load = None
+                for m in LOAD_RE.finditer(parse_buf):
+                    last_load = m.group(1).decode('utf-8', 'replace').strip()
+                if last_load and last_load != current_file:
+                    reset_for_new_track(last_load)
+                    changed = True
+                    # Re-scan for fresh title/type/duration AFTER the Loading line.
+                    # Drop everything before this Loading line so we don't pick
+                    # up stale Module name lines from prior tracks.
+                    load_pos = parse_buf.rfind(b'Loading')
+                    if load_pos > 0:
+                        del parse_buf[:load_pos]
+
+                if state['title'] is None:
+                    m = TITLE_RE.search(parse_buf)
+                    if m:
+                        state['title'] = m.group(1).decode('utf-8', 'replace').strip()
+                        changed = True
+                if state['format'] is None:
+                    m = TYPE_RE.search(parse_buf)
+                    if m:
+                        state['format'] = m.group(1).decode('utf-8', 'replace').strip()
+                        changed = True
+                if state['duration_s'] is None:
+                    m = DUR_RE.search(parse_buf)
+                    if m:
+                        state['duration_s'] = int(m.group(1)) * 60 + int(m.group(2))
+                        changed = True
+                if changed:
+                    write_state(state)
 
             if stdin_fd in r:
                 try:

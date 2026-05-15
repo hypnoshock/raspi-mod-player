@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""modctl — send a single command to mod_playerd over its Unix socket.
+
+  modctl next
+  modctl prev
+  modctl pause
+  modctl resume
+  modctl seek +10
+  modctl seek -5
+  modctl seek 60
+  modctl status
+  modctl quit
+"""
+import socket
+import sys
+
+SOCKET_PATH = '/tmp/modplayer.sock'
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write(__doc__)
+        sys.exit(2)
+    msg = ' '.join(sys.argv[1:]).strip() + '\n'
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect(SOCKET_PATH)
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout) as e:
+        sys.stderr.write(f'modctl: cannot reach daemon ({e})\n')
+        sys.exit(1)
+    s.sendall(msg.encode('utf-8'))
+    s.shutdown(socket.SHUT_WR)
+    chunks = []
+    while True:
+        try:
+            data = s.recv(4096)
+        except socket.timeout:
+            break
+        if not data:
+            break
+        chunks.append(data)
+    s.close()
+    out = b''.join(chunks).decode('utf-8', 'replace')
+    sys.stdout.write(out)
+    if out.startswith('err'):
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

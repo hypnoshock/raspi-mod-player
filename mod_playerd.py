@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""mod_playerd — single-process tracker module player for the Pi Zero W.
+
+Replaces the old xmp + screen + pty + uinput chain with a daemon that
+owns playback directly via libopenmpt, reads GPIO 6/26 buttons, exposes
+a Unix-socket control surface, and writes /tmp/mod_state.json for the
+ST7789 display daemon.
+
+Threading model:
+  main        — owns the loaded Module; dispatches commands; ticks 1Hz
+  renderer    — calls Module.read_stereo; pushes int16 PCM bytes
+  audio out   — sounddevice RawOutputStream; pulls bytes; writes
+  control     — ThreadingUnixStreamServer on /tmp/modplayer.sock
+  gpiozero    — its own internal thread; callbacks push to command queue
+"""
+import ctypes
+import json
+import os
+import queue
+import signal
+import socket
+import socketserver
+import sys
+import threading
+import time
+import traceback
+
+# Force gpiozero to use lgpio (via /dev/gpiochip0, group=gpio) instead of
+# RPi.GPIO (via /dev/mem, requires root). Must be set before gpiozero import.
+os.environ.setdefault('GPIOZERO_PIN_FACTORY', 'lgpio')
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import sounddevice as sd
+from gpiozero import Button
+
+from openmpt import Module, OpenMPTError
+from playlist import Playlist, SOURCE_EMPTY
+
+SAMPLERATE = 44100
+FRAMES_PER_CHUNK = 1024
+CHANNELS = 2
+AUDIO_QUEUE_DEPTH = 4
+AUDIO_DEVICE = 'USB Audio CODEC'
+
+STATE_PATH = '/tmp/mod_state.json'
+SOCKET_PATH = '/tmp/modplayer.sock'
+
+GPIO_NEXT = 26
+GPIO_PREV = 6
+
+
+# ---------------------------------------------------------------------------
+# Renderer + audio threads
+# ---------------------------------------------------------------------------
+
+class _SkipChunk:
+    """Sentinel pushed into the audio queue to signal 'drop everything queued
+    and resume from whatever I push next' (used on seek/next/prev)."""
+
+
+class Player:
+    """Owns the Module pointer and the renderer/audio threads. Methods are
+    called from the main thread only."""
+
+    def __init__(self, on_track_end):
+        self._on_track_end = on_track_end
+        self._module = None
+        self._paused = False
+        self._render_buf = (ctypes.c_int16 * (FRAMES_PER_CHUNK * CHANNELS))()
+        self._audio_q = queue.Queue(maxsize=AUDIO_QUEUE_DEPTH)
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()  # set = paused
+        self._stream = sd.RawOutputStream(
+            samplerate=SAMPLERATE,
+            blocksize=FRAMES_PER_CHUNK,
+            device=AUDIO_DEVICE,
+            channels=CHANNELS,
+            dtype='int16',
+        )
+        self._stream.start()
+        self._render_t = threading.Thread(
+            target=self._render_loop, name='render', daemon=True)
+        self._audio_t = threading.Thread(
+            target=self._audio_loop, name='audio', daemon=True)
+        self._render_t.start()
+        self._audio_t.start()
+
+    # --- public API (main thread only) -------------------------------------
+
+    def load(self, path):
+        """Switch to a new module. Old one is destroyed."""
+        try:
+            new_mod = Module(path)
+        except (OpenMPTError, OSError) as e:
+            print(f'[player] failed to load {path}: {e}', file=sys.stderr)
+            self._module = None
+            return False
+        self._flush_audio()
+        old = self._module
+        self._module = new_mod
+        if old is not None:
+            old.close()
+        return True
+
+    def unload(self):
+        self._flush_audio()
+        if self._module is not None:
+            self._module.close()
+            self._module = None
+
+    def seek(self, seconds):
+        if self._module is None:
+            return 0.0
+        self._flush_audio()
+        return self._module.seek(max(0.0, seconds))
+
+    def pause(self):
+        self._pause_event.set()
+
+    def resume(self):
+        self._pause_event.clear()
+
+    def is_paused(self):
+        return self._pause_event.is_set()
+
+    def position(self):
+        return self._module.position() if self._module else 0.0
+
+    def duration(self):
+        return self._module.duration() if self._module else 0.0
+
+    def title(self):
+        return self._module.title if self._module else ''
+
+    def type_long(self):
+        return self._module.type_long if self._module else ''
+
+    def shutdown(self):
+        self._stop_event.set()
+        self._pause_event.clear()
+        self._flush_audio()
+        # Give the audio + render threads a beat to notice the stop flag
+        # before we yank the stream out from under them (otherwise PortAudio
+        # complains loudly during a concurrent write).
+        time.sleep(0.2)
+        try:
+            self._audio_t.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self._render_t.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+
+    # --- internals ---------------------------------------------------------
+
+    def _flush_audio(self):
+        """Drain pending PCM; on next render we'll start fresh."""
+        try:
+            while True:
+                self._audio_q.get_nowait()
+        except queue.Empty:
+            pass
+        # Mark a skip so any chunk currently being written gets a bookmark.
+        try:
+            self._audio_q.put_nowait(_SkipChunk)
+        except queue.Full:
+            pass
+
+    def _render_loop(self):
+        while not self._stop_event.is_set():
+            if self._module is None or self._pause_event.is_set():
+                time.sleep(0.05)
+                continue
+            try:
+                n = self._module.read_stereo(
+                    SAMPLERATE, FRAMES_PER_CHUNK, self._render_buf)
+            except Exception:
+                traceback.print_exc()
+                time.sleep(0.1)
+                continue
+            if n == 0:
+                # End of track. Tell main and stop pushing audio until it
+                # swaps in a new module.
+                self._on_track_end()
+                # Wait until module changes or stop is requested. Cheap poll.
+                cur = self._module
+                while (not self._stop_event.is_set()
+                       and self._module is cur
+                       and self._module is not None):
+                    time.sleep(0.05)
+                continue
+            chunk = bytes(self._render_buf)[: n * CHANNELS * 2]
+            try:
+                self._audio_q.put(chunk, timeout=1.0)
+            except queue.Full:
+                # Audio thread stuck — drop the chunk rather than block forever.
+                pass
+
+    def _audio_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                chunk = self._audio_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if chunk is _SkipChunk or not chunk:
+                continue
+            try:
+                self._stream.write(chunk)
+            except Exception:
+                traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# Control socket
+# ---------------------------------------------------------------------------
+
+class _CmdHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        line = self.rfile.readline()
+        if not line:
+            return
+        verb, _, args = line.decode('utf-8', 'replace').strip().partition(' ')
+        if not verb:
+            return
+        reply_q = queue.Queue(maxsize=1)
+        self.server.cmd_q.put((verb.lower(), args.strip(), reply_q))
+        try:
+            reply = reply_q.get(timeout=5.0)
+        except queue.Empty:
+            reply = 'err: timeout\n'
+        try:
+            self.wfile.write(reply.encode('utf-8'))
+        except OSError:
+            pass
+
+
+class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, path, cmd_q):
+        if os.path.exists(path):
+            os.unlink(path)
+        super().__init__(path, _CmdHandler)
+        os.chmod(path, 0o666)
+        self.cmd_q = cmd_q
+
+
+# ---------------------------------------------------------------------------
+# Main daemon
+# ---------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self):
+        self.cmd_q = queue.Queue()
+        self.playlist = Playlist()
+        self.player = Player(on_track_end=lambda: self.cmd_q.put(
+            ('_track_end', '', None)))
+        self._stop = False
+        self._last_state_write = 0.0
+        self._last_floppy_poll = 0.0
+
+        # GPIO buttons. gpiozero's default backend is fine on the Pi Zero
+        # (lgpio under the hood on bookworm). Bounce time matches old input.py.
+        self._btn_next = Button(GPIO_NEXT, bounce_time=0.1)
+        self._btn_prev = Button(GPIO_PREV, bounce_time=0.1)
+        self._btn_next.when_pressed = lambda: self.cmd_q.put(('next', '', None))
+        self._btn_prev.when_pressed = lambda: self.cmd_q.put(('prev', '', None))
+
+        self._server = _UnixServer(SOCKET_PATH, self.cmd_q)
+        self._server_t = threading.Thread(
+            target=self._server.serve_forever, name='control', daemon=True)
+        self._server_t.start()
+
+    # --- command dispatch --------------------------------------------------
+
+    def _do_next(self):
+        path = self.playlist.advance(+1)
+        self._play_current(path)
+        return 'ok\n'
+
+    def _do_prev(self):
+        path = self.playlist.advance(-1)
+        self._play_current(path)
+        return 'ok\n'
+
+    def _do_pause(self):
+        self.player.pause()
+        self._write_state()
+        return 'ok\n'
+
+    def _do_resume(self):
+        self.player.resume()
+        self._write_state()
+        return 'ok\n'
+
+    def _do_seek(self, args):
+        if not args:
+            return 'err: seek needs an argument\n'
+        try:
+            n = float(args)
+        except ValueError:
+            return f'err: bad seek arg {args!r}\n'
+        if args.startswith(('+', '-')):
+            target = self.player.position() + n
+        else:
+            target = n
+        actual = self.player.seek(target)
+        self._write_state(force=True)
+        return f'ok {actual:.3f}\n'
+
+    def _do_status(self):
+        return json.dumps(self._state_dict()) + '\n'
+
+    def _do_quit(self):
+        self._stop = True
+        return 'ok\n'
+
+    def _do_track_end(self):
+        # Renderer hit end-of-track. Advance.
+        path = self.playlist.advance(+1)
+        self._play_current(path)
+        return None
+
+    DISPATCH = {
+        'next':       lambda self, _args: self._do_next(),
+        'prev':       lambda self, _args: self._do_prev(),
+        'pause':      lambda self, _args: self._do_pause(),
+        'resume':     lambda self, _args: self._do_resume(),
+        'seek':       lambda self, args: self._do_seek(args),
+        'status':     lambda self, _args: self._do_status(),
+        'quit':       lambda self, _args: self._do_quit(),
+        '_track_end': lambda self, _args: self._do_track_end(),
+    }
+
+    # --- state writer ------------------------------------------------------
+
+    def _state_dict(self):
+        elapsed = self.player.position()
+        return {
+            'file':       self.playlist.current(),
+            'title':      self.player.title(),
+            'format':     self.player.type_long(),
+            'duration_s': int(self.player.duration()),
+            'elapsed_s':  round(elapsed, 2),
+            # Back-derive started_at so mod_display.py's existing wall-clock
+            # math just works without modification.
+            'started_at': time.time() - elapsed,
+            'paused':     self.player.is_paused(),
+            'source':     self.playlist.source,
+        }
+
+    def _write_state(self, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_state_write < 0.9:
+            return
+        self._last_state_write = now
+        tmp = STATE_PATH + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(self._state_dict(), f)
+            os.rename(tmp, STATE_PATH)
+        except OSError:
+            pass
+
+    # --- playback control --------------------------------------------------
+
+    def _play_current(self, path):
+        if path is None:
+            self.player.unload()
+        else:
+            ok = self.player.load(path)
+            # If loading failed, skip forward.
+            if not ok:
+                nxt = self.playlist.advance(+1)
+                if nxt and nxt != path:
+                    self.player.load(nxt)
+        self._write_state(force=True)
+
+    # --- floppy polling ----------------------------------------------------
+
+    def _poll_floppy(self):
+        now = time.monotonic()
+        if now - self._last_floppy_poll < 2.0:
+            return
+        self._last_floppy_poll = now
+        desired = self.playlist.detect_source()
+        if desired != self.playlist.source:
+            self.playlist.reload(desired)
+            if desired == SOURCE_EMPTY:
+                self.player.unload()
+            else:
+                self._play_current(self.playlist.current())
+
+    # --- main loop ---------------------------------------------------------
+
+    def run(self):
+        # Initial source select + first track.
+        desired = self.playlist.detect_source()
+        self.playlist.reload(desired)
+        if desired != SOURCE_EMPTY:
+            self._play_current(self.playlist.current())
+        else:
+            self._write_state(force=True)
+
+        while not self._stop:
+            try:
+                verb, args, reply_q = self.cmd_q.get(timeout=1.0)
+            except queue.Empty:
+                self._write_state()
+                self._poll_floppy()
+                continue
+            try:
+                handler = self.DISPATCH.get(verb)
+                if handler is None:
+                    reply = f'err: unknown verb {verb!r}\n'
+                else:
+                    reply = handler(self, args)
+            except Exception:
+                traceback.print_exc()
+                reply = 'err: internal\n'
+            if reply is not None and reply_q is not None:
+                try:
+                    reply_q.put_nowait(reply)
+                except queue.Full:
+                    pass
+            self._write_state()
+            self._poll_floppy()
+
+        self.shutdown()
+
+    def shutdown(self):
+        try:
+            self._server.shutdown()
+            self._server.server_close()
+        except Exception:
+            pass
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+        self.player.shutdown()
+
+
+def main():
+    daemon = Daemon()
+
+    def on_term(_signum, _frame):
+        daemon._stop = True
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    daemon.run()
+
+
+if __name__ == '__main__':
+    main()

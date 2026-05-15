@@ -5,39 +5,27 @@ The Pi has a 240×240 SPI display showing the currently playing tracker module: 
 ## Architecture
 
 ```
-                       ┌──────────────────────────┐
-   GPIO 6 / 26  ──────▶│ input.py                 │──▶ uinput keys ──▶ tty1
-   (buttons)           │ (gpio_keypress.service)  │
-                       └──────────────────────────┘
-
-   tty1 autologin ──▶ ~/.bashrc
-                       │
-                       └─▶ screen -dmS player mod_monitor.sh
-                                                  │
-                                                  ▼
-                            ┌────────────────────────────────┐
-                            │ mod_monitor.sh                  │
-                            │  - finds .mod/.xm/.s3m/.it      │
-                            │  - shuffles the list            │
-                            │  - calls play_track.py FILE     │
-                            │    for each file in a loop      │
-                            └────────────────────────────────┘
-                                          │
-                                          ▼
-                            ┌────────────────────────────────┐
-                            │ play_track.py FILE              │
-                            │  - spawns `xmp -R FILE` in a    │
-                            │    pseudo-tty (pty.fork)        │
-                            │  - fans xmp's UI back to the    │
-                            │    real terminal                │
-                            │  - forwards stdin keypresses    │
-                            │    to xmp so buttons keep       │
-                            │    working                      │
-                            │  - parses the first ~8 KB of    │
-                            │    xmp's output for the         │
-                            │    module header                │
-                            │  - writes /tmp/mod_state.json   │
-                            └────────────────────────────────┘
+                ┌─────────────────────────────────────────────────┐
+                │ mod_playerd.py        (mod_playerd.service)     │
+                │                                                  │
+   GPIO 6/26 ──▶│  buttons (gpiozero, lgpio backend)              │
+   (buttons)    │   ─▶ ("next"/"prev",) on command queue          │
+                │                                                  │
+   /tmp/        │  control socket (ThreadingUnixStreamServer)     │
+   modplayer ──▶│   ─▶ next/prev/pause/resume/seek/status/quit    │
+   .sock        │                                                  │
+                │  playlist (~/floppy if /dev/sda else            │
+                │   ~/mod_player/mods; shuffle, wrap, reshuffle)  │
+                │                                                  │
+                │  Module (ctypes → libopenmpt.so.0)              │
+                │   renderer thread ─▶ int16 PCM ─▶ audio queue   │
+                │   audio thread ─▶ sounddevice (RawOutputStream) │
+                │                       │                          │
+                │                       ▼                          │
+                │              ALSA direct (USB Audio CODEC)      │
+                │                                                  │
+                │  1Hz tick ─▶ writes /tmp/mod_state.json         │
+                └─────────────────────────────────────────────────┘
                                           │
                                           ▼
                             ┌────────────────────────────────┐
@@ -52,42 +40,28 @@ The Pi has a 240×240 SPI display showing the currently playing tracker module: 
                                   240×240 IPS panel
 ```
 
-`gpio_keypress.service` and the audio pipeline (`xmp` → ALSA/PulseAudio) are untouched by the display feature; the display reads state asynchronously and has no path back into playback.
+The display reads state asynchronously and has no path back into playback. To drive playback from anywhere else (SSH, a future web UI), talk to the daemon over `/tmp/modplayer.sock` — the bundled `modctl` CLI is a thin client (e.g. `modctl next`, `modctl seek +10`, `modctl status`).
 
-## play_track.py — getting state out of xmp
+## mod_playerd.py — state for the display
 
-`xmp` is a CLI tracker player. It prints module metadata to stdout on startup and otherwise runs an interactive UI in the terminal. We need two things from it:
-
-1. Per-track metadata (title, format, duration) so the display can show useful info and draw a correct progress bar.
-2. To keep its interactive UI intact in the screen session — so the user can still see what xmp is doing on the framebuffer console, and so the UInput keystrokes from `input.py` still reach it.
-
-The wrapper accomplishes both by giving xmp a **pseudo-tty** (`pty.fork()`):
-
-- The child process becomes `xmp -R FILE` with its stdin/stdout/stderr connected to the slave end of the pty.
-- The parent (us) reads from the master end in a `select` loop:
-  - Anything xmp writes is forwarded to our own stdout (so the screen session keeps seeing xmp's UI).
-  - The same bytes are accumulated in a small parse buffer and regex-matched for the lines xmp prints early in playback:
-    - `Module name  : <title>`
-    - `Module type  : <format>`
-    - `Duration     : NminSSs`
-- The parent also reads stdin and writes it to the pty so button-driven UInput keystrokes still drive xmp.
-
-Each time any of the three fields is parsed, the wrapper writes (atomically via `tmp+rename`) a JSON state file:
+The daemon writes (atomically via `tmp+rename`) `/tmp/mod_state.json` on every track change and on a 1 Hz tick:
 
 ```
-/tmp/mod_state.json
 {
   "file":        "/home/hypnoshock/mod_player/mods/abandoned_highway.xm",
   "title":       "abandoned highway",
-  "format":      "FastTracker v2.00 XM 1.04",
+  "format":      "FastTracker 2 v1.04",
   "duration_s":  157,
-  "started_at":  1715432104.31
+  "elapsed_s":   42.3,
+  "started_at":  1715432104.31,
+  "paused":      false,
+  "source":      "fallback"
 }
 ```
 
-`started_at` is set at process start (wall-clock seconds, fractional). The display computes elapsed time as `now - started_at` rather than scraping xmp's running status line — xmp's status line uses cursor-movement ANSI codes and is fragile to parse, whereas wall-clock is plenty accurate for a progress bar.
+`elapsed_s` is the authoritative playhead — read straight from `libopenmpt`'s position, so seeks (via socket or future web UI) reflect immediately. `started_at` is back-derived each tick as `time.time() - elapsed_s` so the display's existing wall-clock arithmetic (`elapsed = now - started_at`) keeps working unchanged. When paused, `elapsed_s` stops advancing and `started_at` drifts forward at the same rate, so the bar effectively freezes between ticks.
 
-The wrapper exits when xmp exits, and the outer `for f in files; do play_track.py "$f"; done` loop in `mod_monitor.sh` moves on to the next track. The bash loop re-shuffles after each full pass.
+The display ignores any fields it doesn't know — future additions (visualiser data, queue, etc.) are non-breaking.
 
 ## mod_display.py — drawing the screen
 
@@ -143,16 +117,19 @@ What the local driver does:
 | `sleep(0.125)`                         | 125 ms          |
 | **Total per loop**                    | ~200–220 ms     |
 
-Effective refresh: about 4–5 fps. Plenty for a clock + progress bar; doesn't load the CPU enough to interfere with `xmp` playback.
+Effective refresh: about 4–5 fps. Plenty for a clock + progress bar; doesn't load the CPU enough to interfere with playback.
 
 ## Files involved
 
-| File                              | Purpose                                      |
-|-----------------------------------|----------------------------------------------|
-| `mod_monitor.sh`                  | Disk watcher + per-track playback loop       |
-| `play_track.py`                   | xmp wrapper that emits `/tmp/mod_state.json` |
-| `mod_display.py`                  | Display daemon (local ST7789 driver + UI)    |
-| `mod_display.service`             | systemd unit — runs `mod_display.py` on boot |
-| `docs/240x240-ips.md`             | Display hardware/wiring reference            |
-| `docs/DRIVER-NOTES.md`            | Why we don't use the Pimoroni library        |
-| `docs/DISPLAY-FEATURE.md`         | This file                                    |
+| File                              | Purpose                                              |
+|-----------------------------------|------------------------------------------------------|
+| `mod_playerd.py`                  | Playback daemon — owns libopenmpt + GPIO + socket    |
+| `openmpt.py`                      | ctypes wrapper around `libopenmpt.so.0`              |
+| `playlist.py`                     | Floppy/fallback source state machine + shuffle       |
+| `modctl`                          | Unix-socket CLI client (next/prev/seek/status/...)   |
+| `mod_playerd.service`             | systemd unit — runs `mod_playerd.py` on boot         |
+| `mod_display.py`                  | Display daemon (local ST7789 driver + UI)            |
+| `mod_display.service`             | systemd unit — runs `mod_display.py` on boot         |
+| `docs/240x240-ips.md`             | Display hardware/wiring reference                    |
+| `docs/DRIVER-NOTES.md`            | Why we don't use the Pimoroni library                |
+| `docs/DISPLAY-FEATURE.md`         | This file                                            |

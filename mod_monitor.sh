@@ -13,12 +13,10 @@ start_mod_player() {
     DIR="$1"
     echo "[+] Checking mods in: $DIR"
 
-    # Wait for files to show up on mounted disk
     local files=()
     for i in {1..5}; do
         mapfile -t files < <(find "$DIR" -type f \
-            \( -iname "*.mod" -o -iname "*.xm" -o -iname "*.s3m" -o -iname "*.it" \) \
-            | shuf)
+            \( -iname "*.mod" -o -iname "*.xm" -o -iname "*.s3m" -o -iname "*.it" \))
         if [ ${#files[@]} -gt 0 ]; then
             echo "[+] Found ${#files[@]} mods"
             break
@@ -34,17 +32,11 @@ start_mod_player() {
         return
     fi
 
-    # Loop forever through the shuffled file list, one track at a time, so
-    # play_track.py can publish per-track state to /tmp/mod_state.json.
-    (
-        local _files=("${files[@]}")
-        while true; do
-            for f in "${_files[@]}"; do
-                "$PYTHON" "$PLAY_TRACK" "$f"
-            done
-            mapfile -t _files < <(printf '%s\n' "${_files[@]}" | shuf)
-        done
-    ) &
+    # Single xmp instance handling the whole playlist (-R randomises,
+    # --loop-all keeps looping). play_track.py wraps it in a pty so xmp's
+    # UI still renders to the screen session AND so we can scrape the
+    # "Loading <file>" lines to publish state to /tmp/mod_state.json.
+    "$PYTHON" "$PLAY_TRACK" "${files[@]}" &
     MOD_PLAYER_PID=$!
 }
 

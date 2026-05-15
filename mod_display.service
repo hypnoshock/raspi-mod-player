@@ -4,6 +4,7 @@ After=multi-user.target
 
 [Service]
 ExecStart=/home/hypnoshock/mod_player/.venv/bin/python /home/hypnoshock/mod_player/mod_display.py
+WorkingDirectory=/home/hypnoshock
 Restart=always
 RestartSec=2
 User=hypnoshock
