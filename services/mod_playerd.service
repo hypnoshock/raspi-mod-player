@@ -4,10 +4,11 @@ After=sound.target
 
 [Service]
 Type=simple
-User=hypnoshock
-Group=hypnoshock
+User=__USER__
+Group=__USER__
 SupplementaryGroups=audio gpio
-ExecStart=/home/hypnoshock/mod_player/.venv/bin/python /home/hypnoshock/mod_player/mod_playerd.py
+WorkingDirectory=__HOME__
+ExecStart=__HOME__/mod_player/.venv/bin/python __HOME__/mod_player/mod_playerd.py
 Restart=on-failure
 RestartSec=2
 

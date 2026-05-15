@@ -49,6 +49,11 @@ SOCKET_PATH = '/tmp/modplayer.sock'
 GPIO_NEXT = 26
 GPIO_PREV = 6
 
+# Short press = track skip; hold >= BUTTON_HOLD_S = seek at SEEK_STEP_S per
+# repeat tick (gpiozero fires when_held every BUTTON_HOLD_S while held).
+BUTTON_HOLD_S = 0.5
+SEEK_STEP_S = 5
+
 
 # ---------------------------------------------------------------------------
 # Renderer + audio threads
@@ -267,17 +272,39 @@ class Daemon:
         self._last_state_write = 0.0
         self._last_floppy_poll = 0.0
 
-        # GPIO buttons. gpiozero's default backend is fine on the Pi Zero
-        # (lgpio under the hood on bookworm). Bounce time matches old input.py.
-        self._btn_next = Button(GPIO_NEXT, bounce_time=0.1)
-        self._btn_prev = Button(GPIO_PREV, bounce_time=0.1)
-        self._btn_next.when_pressed = lambda: self.cmd_q.put(('next', '', None))
-        self._btn_prev.when_pressed = lambda: self.cmd_q.put(('prev', '', None))
+        # GPIO buttons. Short press → track skip (on release, if not held).
+        # Hold ≥ BUTTON_HOLD_S → fire seek every BUTTON_HOLD_S until released.
+        self._btn_next = Button(
+            GPIO_NEXT, bounce_time=0.1,
+            hold_time=BUTTON_HOLD_S, hold_repeat=True)
+        self._btn_prev = Button(
+            GPIO_PREV, bounce_time=0.1,
+            hold_time=BUTTON_HOLD_S, hold_repeat=True)
+        self._next_was_held = False
+        self._prev_was_held = False
+        self._wire_button(self._btn_next, 'next', +SEEK_STEP_S, '_next_was_held')
+        self._wire_button(self._btn_prev, 'prev', -SEEK_STEP_S, '_prev_was_held')
 
         self._server = _UnixServer(SOCKET_PATH, self.cmd_q)
         self._server_t = threading.Thread(
             target=self._server.serve_forever, name='control', daemon=True)
         self._server_t.start()
+
+    def _wire_button(self, button, track_verb, seek_step, held_attr):
+        def on_pressed():
+            setattr(self, held_attr, False)
+
+        def on_held():
+            setattr(self, held_attr, True)
+            self.cmd_q.put(('seek', f'{seek_step:+d}', None))
+
+        def on_released():
+            if not getattr(self, held_attr):
+                self.cmd_q.put((track_verb, '', None))
+
+        button.when_pressed = on_pressed
+        button.when_held = on_held
+        button.when_released = on_released
 
     # --- command dispatch --------------------------------------------------
 

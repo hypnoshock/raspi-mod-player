@@ -71,9 +71,8 @@ The two are connected only by the state file, so each can be restarted without t
 | `openmpt.py` | Minimal `ctypes` wrapper around `libopenmpt.so.0`. |
 | `playlist.py` | Source state machine — floppy vs. fallback dir — and shuffle. |
 | `modctl` | Tiny CLI client that talks to `/tmp/modplayer.sock`. |
-| `mod_playerd.service` | systemd unit for the daemon. |
 | `mod_display.py` | Display daemon — Pillow rendering + an inline ST7789 driver. |
-| `mod_display.service` | systemd unit for the display. |
+| `services/*.service` | systemd unit templates (`__USER__` / `__HOME__` placeholders, substituted by the installer). |
 | `install.sh` | One-shot installer for a fresh Pi. |
 | `docs/DISPLAY-FEATURE.md` | Deeper architecture notes for the display side. |
 | `docs/240x240-ips.md` | Hardware/wiring reference for the display panel. |

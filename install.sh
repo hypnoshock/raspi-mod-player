@@ -80,44 +80,16 @@ echo "=> installing modctl into /usr/local/bin"
 chmod +x "$SCRIPT_DIR/modctl"
 ln -sf "$SCRIPT_DIR/modctl" /usr/local/bin/modctl
 
-echo "=> writing systemd units"
-cat > /etc/systemd/system/mod_playerd.service <<EOF
-[Unit]
-Description=Mod player daemon (libopenmpt direct)
-After=sound.target
-
-[Service]
-Type=simple
-User=$REAL_USER
-Group=$REAL_USER
-SupplementaryGroups=audio gpio
-WorkingDirectory=$REAL_HOME
-ExecStart=$VENV/bin/python $REAL_HOME/mod_player/mod_playerd.py
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/mod_display.service <<EOF
-[Unit]
-Description=Mod player ST7789 display
-After=multi-user.target
-
-[Service]
-Type=simple
-User=$REAL_USER
-Group=$REAL_USER
-SupplementaryGroups=spi gpio
-WorkingDirectory=$REAL_HOME
-ExecStart=$VENV/bin/python $REAL_HOME/mod_player/mod_display.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
+echo "=> installing systemd units from services/"
+for unit in mod_playerd.service mod_display.service; do
+    src="$SCRIPT_DIR/services/$unit"
+    if [ ! -f "$src" ]; then
+        echo "missing $src — repo is incomplete"
+        exit 1
+    fi
+    sed -e "s|__USER__|$REAL_USER|g" -e "s|__HOME__|$REAL_HOME|g" \
+        "$src" > "/etc/systemd/system/$unit"
+done
 
 systemctl daemon-reload
 systemctl enable mod_playerd.service mod_display.service
