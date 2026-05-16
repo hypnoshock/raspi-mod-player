@@ -3,3 +3,4 @@ tiny
 __pycache__/
 *.pyc
 *.bak.*
+faves/

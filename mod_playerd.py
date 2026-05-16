@@ -17,6 +17,7 @@ import ctypes
 import json
 import os
 import queue
+import shutil
 import signal
 import socket
 import socketserver
@@ -50,8 +51,12 @@ GPIO_PREV = 6
 
 # Short press = track skip; hold >= BUTTON_HOLD_S = seek at SEEK_STEP_S per
 # repeat tick (gpiozero fires when_held every BUTTON_HOLD_S while held).
+# Pressing both buttons within CHORD_WINDOW_S = copy current track to FAVES_DIR.
 BUTTON_HOLD_S = 0.5
 SEEK_STEP_S = 5
+CHORD_WINDOW_S = 0.25
+FAVES_DIR = os.path.expanduser('~/mod_player/faves')
+COPY_INDICATOR_S = 3.0  # state['copying'] stays true this long after a fav
 
 # Pattern background snapshot — included in /tmp/mod_state.json for the
 # display's faint scrolling pattern view.
@@ -400,6 +405,13 @@ class Daemon:
         # surfaces as state['shuffling']=True for SHUFFLE_INDICATOR_S seconds.
         self._last_shuffles_seen = 0
         self._shuffle_at = 0.0
+        # Chord detection. press_at is None when the button is up; on press,
+        # set to time.monotonic(). If the other button's press_at is within
+        # CHORD_WINDOW_S, fire 'fav' and suppress seek/skip until both up.
+        self._next_press_at = None
+        self._prev_press_at = None
+        self._chord_fired = False
+        self._copy_at = 0.0    # stamped after a successful or no-op fav
 
         # GPIO buttons. Short press → track skip (on release, if not held).
         # Hold ≥ BUTTON_HOLD_S → fire seek every BUTTON_HOLD_S until released.
@@ -411,23 +423,46 @@ class Daemon:
             hold_time=BUTTON_HOLD_S, hold_repeat=True)
         self._next_was_held = False
         self._prev_was_held = False
-        self._wire_button(self._btn_next, 'next', +SEEK_STEP_S, '_next_was_held')
-        self._wire_button(self._btn_prev, 'prev', -SEEK_STEP_S, '_prev_was_held')
+        self._wire_button(self._btn_next, 'next', +SEEK_STEP_S,
+                          '_next_was_held', '_next_press_at', '_prev_press_at')
+        self._wire_button(self._btn_prev, 'prev', -SEEK_STEP_S,
+                          '_prev_was_held', '_prev_press_at', '_next_press_at')
 
         self._server = _UnixServer(SOCKET_PATH, self.cmd_q)
         self._server_t = threading.Thread(
             target=self._server.serve_forever, name='control', daemon=True)
         self._server_t.start()
 
-    def _wire_button(self, button, track_verb, seek_step, held_attr):
+    def _wire_button(self, button, track_verb, seek_step, held_attr,
+                     press_at_attr, other_press_at_attr):
         def on_pressed():
+            now = time.monotonic()
+            setattr(self, press_at_attr, now)
             setattr(self, held_attr, False)
+            # Chord = other button is currently pressed (press_at is set in
+            # on_pressed, cleared in on_released) and was pressed within
+            # CHORD_WINDOW_S — the user managed "both at once" physically.
+            other_at = getattr(self, other_press_at_attr)
+            if (not self._chord_fired
+                    and other_at is not None
+                    and (now - other_at) <= CHORD_WINDOW_S):
+                self._chord_fired = True
+                self.cmd_q.put(('fav', '', None))
 
         def on_held():
+            if self._chord_fired:
+                return  # suppress seek while a chord is in flight
             setattr(self, held_attr, True)
             self.cmd_q.put(('seek', f'{seek_step:+d}', None))
 
         def on_released():
+            setattr(self, press_at_attr, None)
+            if self._chord_fired:
+                # Only clear once BOTH buttons are released, so a late
+                # release of the second doesn't fall through and skip.
+                if self._next_press_at is None and self._prev_press_at is None:
+                    self._chord_fired = False
+                return
             if not getattr(self, held_attr):
                 self.cmd_q.put((track_verb, '', None))
 
@@ -485,12 +520,31 @@ class Daemon:
         self._play_current(path)
         return None
 
+    def _do_fav(self):
+        path = self.playlist.current()
+        if not path:
+            return 'err: nothing playing\n'
+        try:
+            os.makedirs(FAVES_DIR, exist_ok=True)
+            dest = os.path.join(FAVES_DIR, os.path.basename(path))
+            if not os.path.exists(dest):
+                shutil.copy2(path, dest)
+            # Stamp the indicator either way — the user wants confirmation
+            # the chord was registered, whether or not we actually copied.
+            self._copy_at = time.time()
+            self._write_state(force=True)
+            return 'ok\n'
+        except OSError as e:
+            print(f'[fav] copy failed: {e}', file=sys.stderr)
+            return f'err: {e}\n'
+
     DISPATCH = {
         'next':       lambda self, _args: self._do_next(),
         'prev':       lambda self, _args: self._do_prev(),
         'pause':      lambda self, _args: self._do_pause(),
         'resume':     lambda self, _args: self._do_resume(),
         'seek':       lambda self, args: self._do_seek(args),
+        'fav':        lambda self, _args: self._do_fav(),
         'status':     lambda self, _args: self._do_status(),
         'quit':       lambda self, _args: self._do_quit(),
         '_track_end': lambda self, _args: self._do_track_end(),
@@ -512,6 +566,7 @@ class Daemon:
             'paused':         self.player.is_paused(),
             'source':         self.playlist.source,
             'shuffling':      (time.time() - self._shuffle_at) < SHUFFLE_INDICATOR_S,
+            'copying':        (time.time() - self._copy_at) < COPY_INDICATOR_S,
             'playlist_pos':   self.playlist.index + 1,
             'playlist_total': len(self.playlist.files),
         }
@@ -539,7 +594,9 @@ class Daemon:
         # jitter is the display's job (it re-derives elapsed from started_at
         # + wall clock on each draw).
         pos = self.player.peek_position()
-        shuffling = (time.time() - self._shuffle_at) < SHUFFLE_INDICATOR_S
+        now_wall = time.time()
+        shuffling = (now_wall - self._shuffle_at) < SHUFFLE_INDICATOR_S
+        copying = (now_wall - self._copy_at) < COPY_INDICATOR_S
         key = (
             self.playlist.current(),
             self.player.is_paused(),
@@ -548,6 +605,7 @@ class Daemon:
             pos[1],         # current pattern id, or None
             pos[2],         # current row, or None
             shuffling,      # flips off ~3 s after a reshuffle; triggers write
+            copying,        # flips off ~3 s after a fav; triggers write
             self.playlist.index + 1,
             len(self.playlist.files),
         )

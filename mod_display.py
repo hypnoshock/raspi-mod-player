@@ -332,7 +332,12 @@ class Renderer:
 
     def _build_static_stamps(self, state):
         stamps = []
-        header = 'Shuffling' if state.get('shuffling') else 'Now Playing'
+        if state.get('copying'):
+            header = 'Copying track'
+        elif state.get('shuffling'):
+            header = 'Shuffling'
+        else:
+            header = 'Now Playing'
         pos = state.get('playlist_pos')
         total = state.get('playlist_total')
         if pos and total:
@@ -408,6 +413,7 @@ class Renderer:
         static_key = (state.get('title'), state.get('format'),
                       state.get('file'), state.get('source'),
                       bool(state.get('shuffling')),
+                      bool(state.get('copying')),
                       state.get('playlist_pos'), state.get('playlist_total'))
         if static_key != self._static_key:
             self._static_stamps = self._build_static_stamps(state)
