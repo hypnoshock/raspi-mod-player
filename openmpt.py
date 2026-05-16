@@ -117,6 +117,11 @@ class Module:
             detail = msg.value.decode('utf-8', 'replace') if msg.value else 'unknown'
             raise OpenMPTError(f'failed to load {path}: {detail} (code {err.value})')
         self.path = path
+        # Module-constant metadata — cache once so state writes (~10 Hz) don't
+        # pay for a libopenmpt round-trip + UTF-8 decode + free on every tick.
+        self._title = self.metadata('title')
+        self._type_long = self.metadata('type_long')
+        self._duration = float(_lib.openmpt_module_get_duration_seconds(self._mod))
 
     def close(self):
         if self._mod:
@@ -143,7 +148,7 @@ class Module:
         )
 
     def duration(self):
-        return float(_lib.openmpt_module_get_duration_seconds(self._mod))
+        return self._duration
 
     def position(self):
         return float(_lib.openmpt_module_get_position_seconds(self._mod))
@@ -163,11 +168,11 @@ class Module:
 
     @property
     def title(self):
-        return self.metadata('title')
+        return self._title
 
     @property
     def type_long(self):
-        return self.metadata('type_long')
+        return self._type_long
 
     # --- pattern introspection --------------------------------------------
 
