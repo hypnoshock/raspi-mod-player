@@ -112,17 +112,13 @@ class ST7789:
         self._cmd(0x2C)
         self._data(rgb565_bytes)
 
-    def display(self, image):
-        """Convert and push a 240x240 RGB Pillow image. Kept for shutdown()."""
-        arr = np.asarray(image, dtype=np.uint8)
-        self.push_rgb565(rgb_to_rgb565_bytes(arr))
-
     def set_backlight(self, on):
         lgpio.gpio_write(self._h, GPIO_BL, 1 if on else 0)
 
     def shutdown(self):
         try:
-            self.display(Image.new('RGB', (WIDTH, HEIGHT), (0, 0, 0)))
+            # Push a black RGB565 frame (all zeros == black).
+            self.push_rgb565(bytes(HEIGHT * WIDTH * 2))
         except Exception:
             pass
         try:
@@ -131,19 +127,23 @@ class ST7789:
             pass
 
 
-def rgb_to_rgb565_bytes(arr):
-    """arr: (H, W, 3) uint8 → bytes of RGB565 big-endian.
+def rgb565_be(c):
+    """Pack one (R, G, B) tuple into a (hi, lo) byte pair, big-endian
+    RGB565 — the panel's native format."""
+    r, g, b = c
+    return (
+        ((r & 0xF8) | (g >> 5)) & 0xFF,
+        (((g & 0x1C) << 3) | (b >> 3)) & 0xFF,
+    )
 
-    Avoids the uint16 intermediate cast — works directly on uint8 with the
-    natural bit math, ~2x faster than the obvious uint16-shift version on
-    ARMv6 (the cast allocates an extra (H, W) uint16 buffer per channel)."""
-    r = arr[:, :, 0]
-    g = arr[:, :, 1]
-    b = arr[:, :, 2]
-    out = np.empty((arr.shape[0], arr.shape[1], 2), dtype=np.uint8)
-    out[:, :, 0] = (r & 0xF8) | (g >> 5)
-    out[:, :, 1] = ((g & 0x1C) << 3) | (b >> 3)
-    return out.tobytes()
+
+def solid_565_tile(h, w, c):
+    """A solid-colour (h, w, 2) uint8 tile in big-endian RGB565."""
+    hi, lo = rgb565_be(c)
+    t = np.empty((h, w, 2), dtype=np.uint8)
+    t[:, :, 0] = hi
+    t[:, :, 1] = lo
+    return t
 
 
 def load_state():
@@ -201,9 +201,12 @@ class Renderer:
         self.font_mono = ImageFont.truetype(FONT_MONO, 18)
         self.font_pattern = ImageFont.truetype(FONT_MONO, PATTERN_FONT_PX)
 
-        # Reusable buffers — allocated once.
-        self._frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        self._row_tile_cache = {}   # tuple[str,...] -> (H, W) uint8 alpha
+        # Frame buffer is in the panel's native RGB565 big-endian layout —
+        # (H, W, 2) uint8 means we push self._frame.tobytes() straight to
+        # SPI with no per-frame bit math. The conversion happens once
+        # inside each cached tile instead of once per frame.
+        self._frame = np.zeros((HEIGHT, WIDTH, 2), dtype=np.uint8)
+        self._row_tile_cache = {}   # tuple[str,...] -> (H, W, 2) uint8 RGB565
         self._row_tile_w = None     # measured on first use
 
         # Stamp caches — static (rebuilds on track change), dynamic (per
@@ -216,8 +219,9 @@ class Renderer:
     # --- pattern tile cache ------------------------------------------------
 
     def _get_row_tiles(self, row_tuple):
-        """Returns (dim_rgb, current_rgb) — both pre-tinted uint8 (H, W, 3).
-        Cached per unique row tuple. Drawing reduces to a memcpy."""
+        """Returns (dim_565, current_565) — both pre-tinted uint8 (H, W, 2)
+        in big-endian RGB565. Cached per unique row tuple. Drawing reduces
+        to a memcpy into the frame buffer (which is already RGB565)."""
         cached = self._row_tile_cache.get(row_tuple)
         if cached is not None:
             return cached
@@ -231,13 +235,16 @@ class Renderer:
         d = ImageDraw.Draw(img)
         d.text((0, 0), text, font=self.font_pattern, fill=255)
         alpha = np.asarray(img, dtype=np.uint16)        # (H, W) 0..255
-        # Pre-tint both colour versions. uint16 multiply→uint8 cast is the
-        # work we used to do per frame; now it's once per unique row.
+        # Pre-tint into RGB565 directly. This was the work we used to do per
+        # frame across the whole 240x240 buffer; doing it once per unique row
+        # tile is dramatically cheaper.
         def tint(c):
-            t = np.empty((PATTERN_ROW_HEIGHT, self._row_tile_w, 3), dtype=np.uint8)
-            t[:, :, 0] = (alpha * c[0] // 255).astype(np.uint8)
-            t[:, :, 1] = (alpha * c[1] // 255).astype(np.uint8)
-            t[:, :, 2] = (alpha * c[2] // 255).astype(np.uint8)
+            sr = (alpha * c[0] // 255).astype(np.uint8)
+            sg = (alpha * c[1] // 255).astype(np.uint8)
+            sb = (alpha * c[2] // 255).astype(np.uint8)
+            t = np.empty((PATTERN_ROW_HEIGHT, self._row_tile_w, 2), dtype=np.uint8)
+            t[:, :, 0] = (sr & 0xF8) | (sg >> 5)
+            t[:, :, 1] = ((sg & 0x1C) << 3) | (sb >> 3)
             return t
         tiles = (tint(PATTERN_COLOR_DIM), tint(PATTERN_COLOR_CURRENT))
         if len(self._row_tile_cache) > 1024:
@@ -293,7 +300,7 @@ class Renderer:
     # Dynamic stamps rebuild on every second-tick / progress-bar pixel.
 
     def _render_text_stamp(self, text, font, fill):
-        """Render a string to a tightly-cropped (h, w, 3) uint8 stamp."""
+        """Render a string to a tightly-cropped (h, w, 2) uint8 RGB565 stamp."""
         # Measure first.
         tmp = Image.new('L', (WIDTH, 50), 0)
         d = ImageDraw.Draw(tmp)
@@ -303,18 +310,20 @@ class Renderer:
         img = Image.new('L', (w, h), 0)
         ImageDraw.Draw(img).text((0, 0), text, font=font, fill=255)
         alpha = np.asarray(img, dtype=np.uint16)
-        rgb = np.empty((h, w, 3), dtype=np.uint8)
-        rgb[:, :, 0] = (alpha * fill[0] // 255).astype(np.uint8)
-        rgb[:, :, 1] = (alpha * fill[1] // 255).astype(np.uint8)
-        rgb[:, :, 2] = (alpha * fill[2] // 255).astype(np.uint8)
-        return rgb
+        sr = (alpha * fill[0] // 255).astype(np.uint8)
+        sg = (alpha * fill[1] // 255).astype(np.uint8)
+        sb = (alpha * fill[2] // 255).astype(np.uint8)
+        out = np.empty((h, w, 2), dtype=np.uint8)
+        out[:, :, 0] = (sr & 0xF8) | (sg >> 5)
+        out[:, :, 1] = ((sg & 0x1C) << 3) | (sb >> 3)
+        return out
 
     def _build_static_stamps(self, state):
         stamps = []
         stamps.append((8, 10, self._render_text_stamp(
             'Now Playing', self.font_small, (180, 180, 180))))
         # Divider line — a thin rectangle.
-        line = np.full((1, WIDTH - 20, 3), (60, 60, 80), dtype=np.uint8)
+        line = solid_565_tile(1, WIDTH - 20, (60, 60, 80))
         stamps.append((26, 10, line))
 
         title = state.get('title') or os.path.basename(state.get('file', '?'))
@@ -354,11 +363,11 @@ class Renderer:
         bx0, by0, bx1, by1 = 10, 205, WIDTH - 10, 225
         bw = bx1 - bx0 + 1
         bh = by1 - by0 + 1
-        outline_colour = np.array([80, 80, 120], dtype=np.uint8)
-        top = np.full((1, bw, 3), outline_colour, dtype=np.uint8)
-        bot = np.full((1, bw, 3), outline_colour, dtype=np.uint8)
-        lft = np.full((bh, 1, 3), outline_colour, dtype=np.uint8)
-        rgt = np.full((bh, 1, 3), outline_colour, dtype=np.uint8)
+        outline_colour = (80, 80, 120)
+        top = solid_565_tile(1, bw, outline_colour)
+        bot = solid_565_tile(1, bw, outline_colour)
+        lft = solid_565_tile(bh, 1, outline_colour)
+        rgt = solid_565_tile(bh, 1, outline_colour)
         stamps.append((by0, bx0, top))
         stamps.append((by1, bx0, bot))
         stamps.append((by0, bx0, lft))
@@ -367,8 +376,7 @@ class Renderer:
         if frac is not None and frac > 0:
             fill_x = bx0 + int((bx1 - bx0) * frac)
             if fill_x > bx0:
-                fill = np.full((bh - 2, fill_x - bx0, 3),
-                               (80, 180, 255), dtype=np.uint8)
+                fill = solid_565_tile(bh - 2, fill_x - bx0, (80, 180, 255))
                 stamps.append((by0 + 1, bx0 + 1, fill))
         return stamps
 
@@ -406,7 +414,7 @@ class Renderer:
             self._draw_pattern(pattern)
         self._apply_stamps(self._static_stamps)
         self._apply_stamps(self._dynamic_stamps)
-        self.display.push_rgb565(rgb_to_rgb565_bytes(self._frame))
+        self.display.push_rgb565(self._frame.tobytes())
 
     def draw(self, state):
         self._ensure_stamps(state)
@@ -416,7 +424,7 @@ class Renderer:
         self._frame.fill(0)
         stamp = self._render_text_stamp('Idle', self.font_big, (120, 120, 120))
         self._frame[100:100 + stamp.shape[0], 10:10 + stamp.shape[1]] = stamp
-        self.display.push_rgb565(rgb_to_rgb565_bytes(self._frame))
+        self.display.push_rgb565(self._frame.tobytes())
         # Invalidate caches so re-entering playback redraws fresh.
         self._static_key = None
         self._dynamic_key = None
