@@ -56,7 +56,7 @@ SEEK_STEP_S = 5
 # Pattern background snapshot — included in /tmp/mod_state.json for the
 # display's faint scrolling pattern view.
 PATTERN_WINDOW_ROWS = 17        # odd so there is a true centre row
-PATTERN_MAX_CHANNELS = 6        # truncate wide modules; first N channels only
+PATTERN_MAX_CHANNELS = 8        # truncate wide modules; first N channels only
 STATE_WRITE_THROTTLE_S = 0.05   # target ~20Hz state writes for smooth pattern scroll
 
 
