@@ -23,6 +23,11 @@ def _find_tracker_files(root):
     out = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
+            # Skip dotfiles, including macOS AppleDouble resource forks
+            # (`._foo.mod`) which share the extension but aren't valid modules
+            # and freeze libopenmpt on load.
+            if name.startswith('.'):
+                continue
             if os.path.splitext(name)[1].lower() in EXTS:
                 out.append(os.path.join(dirpath, name))
     return out
