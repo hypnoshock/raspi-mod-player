@@ -57,6 +57,42 @@ _lib.openmpt_module_get_metadata.restype = c_void_p  # so we can free it
 _lib.openmpt_free_string.argtypes = [c_void_p]
 _lib.openmpt_free_string.restype = None
 
+# Pattern introspection — for the display's scrolling background view.
+
+_lib.openmpt_module_get_current_pattern.argtypes = [c_void_p]
+_lib.openmpt_module_get_current_pattern.restype = c_int32
+
+_lib.openmpt_module_get_current_row.argtypes = [c_void_p]
+_lib.openmpt_module_get_current_row.restype = c_int32
+
+_lib.openmpt_module_get_current_order.argtypes = [c_void_p]
+_lib.openmpt_module_get_current_order.restype = c_int32
+
+_lib.openmpt_module_get_num_channels.argtypes = [c_void_p]
+_lib.openmpt_module_get_num_channels.restype = c_int32
+
+_lib.openmpt_module_get_pattern_num_rows.argtypes = [c_void_p, c_int32]
+_lib.openmpt_module_get_pattern_num_rows.restype = c_int32
+
+_lib.openmpt_module_format_pattern_row_channel_command.argtypes = [
+    c_void_p, c_int32, c_int32, c_int32, c_int,
+]
+_lib.openmpt_module_format_pattern_row_channel_command.restype = c_void_p
+
+_lib.openmpt_module_get_current_speed.argtypes = [c_void_p]
+_lib.openmpt_module_get_current_speed.restype = c_int32
+
+_lib.openmpt_module_get_current_estimated_bpm.argtypes = [c_void_p]
+_lib.openmpt_module_get_current_estimated_bpm.restype = c_double
+
+# libopenmpt command enum (from libopenmpt.h)
+COMMAND_NOTE = 0
+COMMAND_INSTRUMENT = 1
+COMMAND_VOLUMEEFFECT = 2
+COMMAND_EFFECT = 3
+COMMAND_VOLUME = 4
+COMMAND_PARAMETER = 5
+
 
 class OpenMPTError(Exception):
     pass
@@ -132,3 +168,41 @@ class Module:
     @property
     def type_long(self):
         return self.metadata('type_long')
+
+    # --- pattern introspection --------------------------------------------
+
+    def current_pattern(self):
+        return int(_lib.openmpt_module_get_current_pattern(self._mod))
+
+    def current_row(self):
+        return int(_lib.openmpt_module_get_current_row(self._mod))
+
+    def current_order(self):
+        return int(_lib.openmpt_module_get_current_order(self._mod))
+
+    def num_channels(self):
+        return int(_lib.openmpt_module_get_num_channels(self._mod))
+
+    def current_speed(self):
+        return int(_lib.openmpt_module_get_current_speed(self._mod))
+
+    def current_bpm(self):
+        return float(_lib.openmpt_module_get_current_estimated_bpm(self._mod))
+
+    def pattern_num_rows(self, pattern):
+        return int(_lib.openmpt_module_get_pattern_num_rows(self._mod, pattern))
+
+    def format_cell(self, pattern, row, channel, command=COMMAND_NOTE):
+        """Format a single column of one pattern cell as a string.
+        For COMMAND_NOTE this returns 3-char strings like 'C-4' or '---'."""
+        ptr = _lib.openmpt_module_format_pattern_row_channel_command(
+            self._mod, pattern, row, channel, command)
+        if not ptr:
+            return ''
+        try:
+            return ctypes.string_at(ptr).decode('utf-8', 'replace')
+        finally:
+            _lib.openmpt_free_string(ptr)
+
+    def format_cell_note(self, pattern, row, channel):
+        return self.format_cell(pattern, row, channel, COMMAND_NOTE)

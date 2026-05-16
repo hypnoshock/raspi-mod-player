@@ -54,6 +54,12 @@ GPIO_PREV = 6
 BUTTON_HOLD_S = 0.5
 SEEK_STEP_S = 5
 
+# Pattern background snapshot — included in /tmp/mod_state.json for the
+# display's faint scrolling pattern view.
+PATTERN_WINDOW_ROWS = 17        # odd so there is a true centre row
+PATTERN_MAX_CHANNELS = 6        # truncate wide modules; first N channels only
+STATE_WRITE_THROTTLE_S = 0.05   # target ~20Hz state writes for smooth pattern scroll
+
 
 # ---------------------------------------------------------------------------
 # Renderer + audio threads
@@ -72,6 +78,13 @@ class Player:
         self._on_track_end = on_track_end
         self._module = None
         self._paused = False
+        # Cache formatted pattern rows per pattern_id for the current track.
+        # Patterns are static within a track; formatting once and slicing
+        # windows is much cheaper than calling libopenmpt 60+ times per tick.
+        self._pattern_cache = {}
+        # Row-start tracking for smooth display interpolation between updates.
+        self._last_row_key = None   # (pattern, row)
+        self._row_start_at = 0.0    # wall-clock time when current row began
         self._render_buf = (ctypes.c_int16 * (FRAMES_PER_CHUNK * CHANNELS))()
         self._audio_q = queue.Queue(maxsize=AUDIO_QUEUE_DEPTH)
         self._stop_event = threading.Event()
@@ -100,10 +113,14 @@ class Player:
         except (OpenMPTError, OSError) as e:
             print(f'[player] failed to load {path}: {e}', file=sys.stderr)
             self._module = None
+            self._pattern_cache = {}
             return False
         self._flush_audio()
         old = self._module
         self._module = new_mod
+        self._pattern_cache = {}
+        self._last_row_key = None
+        self._row_start_at = 0.0
         if old is not None:
             old.close()
         return True
@@ -113,6 +130,9 @@ class Player:
         if self._module is not None:
             self._module.close()
             self._module = None
+        self._pattern_cache = {}
+        self._last_row_key = None
+        self._row_start_at = 0.0
 
     def seek(self, seconds):
         if self._module is None:
@@ -140,6 +160,72 @@ class Player:
 
     def type_long(self):
         return self._module.type_long if self._module else ''
+
+    def pattern_snapshot(self, window, max_channels):
+        """Return a window of formatted note rows centred on the current
+        playhead, plus surrounding metadata, or None if no module loaded.
+
+        Includes `row_start_at` (wall clock when this row began) and
+        `row_duration_s` (estimated seconds per row) so the display can
+        smoothly interpolate the scroll position between state updates."""
+        m = self._module
+        if m is None:
+            return None
+        try:
+            cur_pat = m.current_pattern()
+            cur_row = m.current_row()
+            cur_order = m.current_order()
+            num_rows = m.pattern_num_rows(cur_pat)
+            num_channels = m.num_channels()
+            speed = m.current_speed()
+            bpm = m.current_bpm()
+        except Exception:
+            return None
+        if num_rows <= 0 or num_channels <= 0:
+            return None
+
+        # Row-start timestamp tracking. When row (or pattern) changes,
+        # stamp the wall-clock time so the display knows when this row
+        # began and can interpolate its scroll position.
+        row_key = (cur_pat, cur_row)
+        if row_key != self._last_row_key:
+            self._row_start_at = time.time()
+            self._last_row_key = row_key
+        # Row duration formula: 2.5 * speed / BPM seconds (classic tracker).
+        if bpm > 0 and speed > 0:
+            row_duration_s = 2.5 * speed / bpm
+        else:
+            row_duration_s = 0.05  # fallback; display will clamp
+
+        chs = min(num_channels, max_channels)
+        cached = self._pattern_cache.get(cur_pat)
+        if cached is None or len(cached) != num_rows or (cached and len(cached[0]) != chs):
+            cached = [
+                [m.format_cell_note(cur_pat, r, c) for c in range(chs)]
+                for r in range(num_rows)
+            ]
+            self._pattern_cache[cur_pat] = cached
+
+        half = window // 2
+        lo = cur_row - half
+        hi = lo + window
+        rows = []
+        for r in range(lo, hi):
+            if 0 <= r < num_rows:
+                rows.append(cached[r])
+            else:
+                rows.append([''] * chs)
+        return {
+            'order':          cur_order,
+            'pattern':        cur_pat,
+            'row':            cur_row,
+            'num_rows':       num_rows,
+            'num_channels':   num_channels,
+            'rows':           rows,
+            'current_idx':    half,
+            'row_start_at':   self._row_start_at,
+            'row_duration_s': row_duration_s,
+        }
 
     def shutdown(self):
         self._stop_event.set()
@@ -371,7 +457,7 @@ class Daemon:
 
     def _state_dict(self):
         elapsed = self.player.position()
-        return {
+        d = {
             'file':       self.playlist.current(),
             'title':      self.player.title(),
             'format':     self.player.type_long(),
@@ -383,16 +469,22 @@ class Daemon:
             'paused':     self.player.is_paused(),
             'source':     self.playlist.source,
         }
+        pat = self.player.pattern_snapshot(
+            PATTERN_WINDOW_ROWS, PATTERN_MAX_CHANNELS)
+        if pat is not None:
+            d['pattern'] = pat
+        return d
 
     def _write_state(self, force=False):
         now = time.monotonic()
-        if not force and now - self._last_state_write < 0.9:
+        if not force and now - self._last_state_write < STATE_WRITE_THROTTLE_S:
             return
+        sd = self._state_dict()
         self._last_state_write = now
         tmp = STATE_PATH + '.tmp'
         try:
             with open(tmp, 'w') as f:
-                json.dump(self._state_dict(), f)
+                json.dump(sd, f)
             os.rename(tmp, STATE_PATH)
         except OSError:
             pass
@@ -439,7 +531,10 @@ class Daemon:
 
         while not self._stop:
             try:
-                verb, args, reply_q = self.cmd_q.get(timeout=1.0)
+                # Timeout doubles as the tick interval. STATE_WRITE_THROTTLE_S
+                # sets the cap on write frequency; this matches so the loop
+                # wakes up often enough for the throttle to actually fire.
+                verb, args, reply_q = self.cmd_q.get(timeout=STATE_WRITE_THROTTLE_S)
             except queue.Empty:
                 self._write_state()
                 self._poll_floppy()
