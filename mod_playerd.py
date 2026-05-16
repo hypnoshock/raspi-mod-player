@@ -57,6 +57,7 @@ SEEK_STEP_S = 5
 # display's faint scrolling pattern view.
 PATTERN_WINDOW_ROWS = 17        # odd so there is a true centre row
 PATTERN_MAX_CHANNELS = 8        # truncate wide modules; first N channels only
+SHUFFLE_INDICATOR_S = 3.0       # how long state['shuffling'] stays true after a reshuffle
 STATE_WRITE_THROTTLE_S = 0.05   # ~20Hz wake-rate; row changes happen at ~5-10Hz and we want to detect each one within half a row, so the display scroll looks consistent. The wake itself is a cheap no-op when the row hasn't advanced (peek_position is 3 ctypes calls + a tuple compare).
 
 
@@ -395,6 +396,10 @@ class Daemon:
         self._last_state_write = 0.0
         self._last_state_key = None
         self._last_floppy_poll = 0.0
+        # Shuffle indicator: stamped each time playlist.shuffles bumps, then
+        # surfaces as state['shuffling']=True for SHUFFLE_INDICATOR_S seconds.
+        self._last_shuffles_seen = 0
+        self._shuffle_at = 0.0
 
         # GPIO buttons. Short press → track skip (on release, if not held).
         # Hold ≥ BUTTON_HOLD_S → fire seek every BUTTON_HOLD_S until released.
@@ -439,7 +444,7 @@ class Daemon:
 
     def _do_prev(self):
         path = self.playlist.advance(-1)
-        self._play_current(path)
+        self._play_current(path, direction=-1)
         return 'ok\n'
 
     def _do_pause(self):
@@ -496,16 +501,19 @@ class Daemon:
     def _state_dict(self):
         elapsed = self.player.position()
         d = {
-            'file':       self.playlist.current(),
-            'title':      self.player.title(),
-            'format':     self.player.type_long(),
-            'duration_s': int(self.player.duration()),
-            'elapsed_s':  round(elapsed, 2),
+            'file':           self.playlist.current(),
+            'title':          self.player.title(),
+            'format':         self.player.type_long(),
+            'duration_s':     int(self.player.duration()),
+            'elapsed_s':      round(elapsed, 2),
             # Back-derive started_at so mod_display.py's existing wall-clock
             # math just works without modification.
-            'started_at': time.time() - elapsed,
-            'paused':     self.player.is_paused(),
-            'source':     self.playlist.source,
+            'started_at':     time.time() - elapsed,
+            'paused':         self.player.is_paused(),
+            'source':         self.playlist.source,
+            'shuffling':      (time.time() - self._shuffle_at) < SHUFFLE_INDICATOR_S,
+            'playlist_pos':   self.playlist.index + 1,
+            'playlist_total': len(self.playlist.files),
         }
         pat = self.player.pattern_snapshot(
             PATTERN_WINDOW_ROWS, PATTERN_MAX_CHANNELS)
@@ -517,6 +525,13 @@ class Daemon:
         now = time.monotonic()
         if not force and now - self._last_state_write < STATE_WRITE_THROTTLE_S:
             return
+        # Stamp the shuffle timestamp the first tick after the playlist
+        # actually reshuffled. Done here so every code path that mutates
+        # the playlist is covered without having to remember at each
+        # call site.
+        if self.playlist.shuffles != self._last_shuffles_seen:
+            self._last_shuffles_seen = self.playlist.shuffles
+            self._shuffle_at = time.time()
         # Build the change-detection key from cheap signals only — we do NOT
         # call _state_dict() yet because that triggers pattern_snapshot()
         # which is the expensive bit. int(elapsed) lives in the key so the
@@ -524,6 +539,7 @@ class Daemon:
         # jitter is the display's job (it re-derives elapsed from started_at
         # + wall clock on each draw).
         pos = self.player.peek_position()
+        shuffling = (time.time() - self._shuffle_at) < SHUFFLE_INDICATOR_S
         key = (
             self.playlist.current(),
             self.player.is_paused(),
@@ -531,6 +547,9 @@ class Daemon:
             int(pos[0]),    # elapsed seconds (truncated)
             pos[1],         # current pattern id, or None
             pos[2],         # current row, or None
+            shuffling,      # flips off ~3 s after a reshuffle; triggers write
+            self.playlist.index + 1,
+            len(self.playlist.files),
         )
         if not force and key == self._last_state_key:
             return
@@ -547,16 +566,28 @@ class Daemon:
 
     # --- playback control --------------------------------------------------
 
-    def _play_current(self, path):
+    def _play_current(self, path, direction=+1):
+        """Try to load `path`. If it fails (corrupt file, libopenmpt rejects),
+        keep advancing in `direction` until something loads or we've tried
+        every file in the playlist. `direction` defaults to +1 so callers
+        with no preferred direction (startup, source change, track end) skip
+        forward; `_do_prev` passes -1 so a 'back' press past a corrupt file
+        doesn't bounce forward and land back where it started."""
         if path is None:
             self.player.unload()
-        else:
-            ok = self.player.load(path)
-            # If loading failed, skip forward.
-            if not ok:
-                nxt = self.playlist.advance(+1)
-                if nxt and nxt != path:
-                    self.player.load(nxt)
+            self._write_state(force=True)
+            return
+        cur = path
+        budget = max(1, len(self.playlist.files))
+        while budget > 0:
+            if self.player.load(cur):
+                break
+            budget -= 1
+            nxt = self.playlist.advance(direction)
+            if nxt is None or nxt == cur:
+                self.player.unload()
+                break
+            cur = nxt
         self._write_state(force=True)
 
     # --- floppy polling ----------------------------------------------------

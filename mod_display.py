@@ -332,8 +332,20 @@ class Renderer:
 
     def _build_static_stamps(self, state):
         stamps = []
+        header = 'Shuffling' if state.get('shuffling') else 'Now Playing'
+        pos = state.get('playlist_pos')
+        total = state.get('playlist_total')
+        if pos and total:
+            header = f'{header}  {pos} / {total}'
         stamps.append((8, 10, self._render_text_stamp(
-            'Now Playing', self.font_small, (180, 180, 180))))
+            header, self.font_small, (180, 180, 180))))
+        # Magenta 'F' in the top-right corner while the USB stick is the
+        # active source, so it's obvious at a glance which tree the
+        # playlist is coming from.
+        if state.get('source') == 'floppy':
+            f_stamp = self._render_text_stamp(
+                'F', self.font_pattern, (255, 0, 255))
+            stamps.append((10, WIDTH - f_stamp.shape[1] - 6, f_stamp))
         # Divider line — a thin rectangle.
         line = solid_565_tile(1, WIDTH - 20, (60, 60, 80))
         stamps.append((26, 10, line))
@@ -394,7 +406,9 @@ class Renderer:
 
     def _ensure_stamps(self, state):
         static_key = (state.get('title'), state.get('format'),
-                      state.get('file'))
+                      state.get('file'), state.get('source'),
+                      bool(state.get('shuffling')),
+                      state.get('playlist_pos'), state.get('playlist_total'))
         if static_key != self._static_key:
             self._static_stamps = self._build_static_stamps(state)
             self._static_key = static_key

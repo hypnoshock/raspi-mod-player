@@ -28,9 +28,17 @@ def _is_tracker_file(name):
     return os.path.splitext(name)[1].lower() in EXTS
 
 
+def _prune_dotdirs(dirnames):
+    """Mutate dirnames in place to drop hidden directories. macOS USB sticks
+    carry `.Trashes`, `.Spotlight-V100`, `.fseventsd`, etc. that contain real
+    .mod files we don't want to play (deleted-to-trash or system metadata)."""
+    dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+
+
 def _find_tracker_files(root):
     out = []
-    for dirpath, _dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        _prune_dotdirs(dirnames)
         for name in filenames:
             if _is_tracker_file(name):
                 out.append(os.path.join(dirpath, name))
@@ -43,7 +51,8 @@ def _has_any_tracker_file(root):
     file (~hundreds of syscalls on a real floppy); detect_source() only needs
     a yes/no, and is called on a 2-second poll, so the difference shows up as
     measurable steady-state CPU."""
-    for _dirpath, _dirnames, filenames in os.walk(root):
+    for _dirpath, dirnames, filenames in os.walk(root):
+        _prune_dotdirs(dirnames)
         for name in filenames:
             if _is_tracker_file(name):
                 return True
@@ -69,6 +78,9 @@ class Playlist:
         self.source = None       # SOURCE_* string
         self.files = []
         self.index = 0
+        # Bumped on every reshuffle so the daemon can flag "Shuffling" in
+        # the state for the display to show.
+        self.shuffles = 0
         # Reseed shuffle each run so reboots don't replay the same order.
         self._rng = random.Random()
 
@@ -110,6 +122,7 @@ class Playlist:
         else:
             self.files = []
         self._rng.shuffle(self.files)
+        self.shuffles += 1
         self.index = 0
         return True
 
@@ -125,6 +138,7 @@ class Playlist:
         self.index += delta
         if self.index >= len(self.files):
             self._rng.shuffle(self.files)
+            self.shuffles += 1
             self.index = 0
         elif self.index < 0:
             self.index = len(self.files) - 1
