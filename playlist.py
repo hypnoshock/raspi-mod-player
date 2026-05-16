@@ -19,18 +19,35 @@ SOURCE_FALLBACK = 'fallback'
 SOURCE_EMPTY = 'empty'
 
 
+def _is_tracker_file(name):
+    # Skip dotfiles, including macOS AppleDouble resource forks (`._foo.mod`)
+    # which share the extension but aren't valid modules and freeze libopenmpt
+    # on load.
+    if name.startswith('.'):
+        return False
+    return os.path.splitext(name)[1].lower() in EXTS
+
+
 def _find_tracker_files(root):
     out = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
-            # Skip dotfiles, including macOS AppleDouble resource forks
-            # (`._foo.mod`) which share the extension but aren't valid modules
-            # and freeze libopenmpt on load.
-            if name.startswith('.'):
-                continue
-            if os.path.splitext(name)[1].lower() in EXTS:
+            if _is_tracker_file(name):
                 out.append(os.path.join(dirpath, name))
     return out
+
+
+def _has_any_tracker_file(root):
+    """Cheap 'does this tree contain a usable module?' check — stops on the
+    first match. _find_tracker_files() walks every directory and stats every
+    file (~hundreds of syscalls on a real floppy); detect_source() only needs
+    a yes/no, and is called on a 2-second poll, so the difference shows up as
+    measurable steady-state CPU."""
+    for _dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if _is_tracker_file(name):
+                return True
+    return False
 
 
 def _is_mounted(path):
@@ -68,7 +85,7 @@ class Playlist:
                     )
                 except subprocess.TimeoutExpired:
                     return SOURCE_FALLBACK
-            if _is_mounted(FLOPPY_MOUNT) and _find_tracker_files(FLOPPY_MOUNT):
+            if _is_mounted(FLOPPY_MOUNT) and _has_any_tracker_file(FLOPPY_MOUNT):
                 return SOURCE_FLOPPY
         else:
             # Disk gone — try to unmount if we still have it mounted.
@@ -77,7 +94,7 @@ class Playlist:
                     ['sudo', '/bin/umount', FLOPPY_MOUNT],
                     check=False, timeout=10,
                 )
-        if os.path.isdir(FALLBACK_DIR) and _find_tracker_files(FALLBACK_DIR):
+        if os.path.isdir(FALLBACK_DIR) and _has_any_tracker_file(FALLBACK_DIR):
             return SOURCE_FALLBACK
         return SOURCE_EMPTY
 

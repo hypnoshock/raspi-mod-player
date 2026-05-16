@@ -437,7 +437,22 @@ def main():
 
     frames = 0
     last_report = time.monotonic()
+    # Redraw only when the daemon has rewritten /tmp/mod_state.json. The
+    # daemon now suppresses no-op writes, so this mtime-poll is a cheap
+    # signal that something visible changed. IDLE_POLL_S caps how long
+    # the display can lag a real change.
+    last_mtime = -1
+    IDLE_POLL_S = 0.2
     while True:
+        try:
+            mtime = os.stat(STATE_PATH).st_mtime_ns
+        except FileNotFoundError:
+            mtime = 0
+        if mtime == last_mtime:
+            time.sleep(IDLE_POLL_S)
+            continue
+        last_mtime = mtime
+
         state = load_state()
         is_idle = False
         if state is None:

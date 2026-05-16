@@ -57,7 +57,7 @@ SEEK_STEP_S = 5
 # display's faint scrolling pattern view.
 PATTERN_WINDOW_ROWS = 17        # odd so there is a true centre row
 PATTERN_MAX_CHANNELS = 8        # truncate wide modules; first N channels only
-STATE_WRITE_THROTTLE_S = 0.05   # target ~20Hz state writes for smooth pattern scroll
+STATE_WRITE_THROTTLE_S = 0.1    # ~10Hz wake-rate; row changes happen at ~5-8Hz so this catches them with at most one tick of lag, and the wake-up itself is now a cheap no-op when nothing has changed
 
 
 def _pick_audio_device():
@@ -176,6 +176,18 @@ class Player:
 
     def position(self):
         return self._module.position() if self._module else 0.0
+
+    def peek_position(self):
+        """Cheap (elapsed_s, current_pattern, current_row) snapshot for the
+        state-write change-detection key. None for pat/row when nothing is
+        loaded. Avoids building the full pattern_snapshot dict."""
+        m = self._module
+        if m is None:
+            return (0.0, None, None)
+        try:
+            return (m.position(), m.current_pattern(), m.current_row())
+        except Exception:
+            return (0.0, None, None)
 
     def duration(self):
         return self._module.duration() if self._module else 0.0
@@ -381,6 +393,7 @@ class Daemon:
             ('_track_end', '', None)))
         self._stop = False
         self._last_state_write = 0.0
+        self._last_state_key = None
         self._last_floppy_poll = 0.0
 
         # GPIO buttons. Short press → track skip (on release, if not held).
@@ -504,8 +517,26 @@ class Daemon:
         now = time.monotonic()
         if not force and now - self._last_state_write < STATE_WRITE_THROTTLE_S:
             return
-        sd = self._state_dict()
+        # Build the change-detection key from cheap signals only — we do NOT
+        # call _state_dict() yet because that triggers pattern_snapshot()
+        # which is the expensive bit. int(elapsed) lives in the key so the
+        # progress bar / time text still tick once per second; sub-second
+        # jitter is the display's job (it re-derives elapsed from started_at
+        # + wall clock on each draw).
+        pos = self.player.peek_position()
+        key = (
+            self.playlist.current(),
+            self.player.is_paused(),
+            self.playlist.source,
+            int(pos[0]),    # elapsed seconds (truncated)
+            pos[1],         # current pattern id, or None
+            pos[2],         # current row, or None
+        )
+        if not force and key == self._last_state_key:
+            return
+        self._last_state_key = key
         self._last_state_write = now
+        sd = self._state_dict()
         tmp = STATE_PATH + '.tmp'
         try:
             with open(tmp, 'w') as f:
