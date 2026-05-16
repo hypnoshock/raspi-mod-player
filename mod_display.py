@@ -442,7 +442,10 @@ def main():
     # signal that something visible changed. IDLE_POLL_S caps how long
     # the display can lag a real change.
     last_mtime = -1
-    IDLE_POLL_S = 0.2
+    # Poll fast enough that we never miss a row tick. os.stat on tmpfs is
+    # ~1 microsecond — the work is in the redraw, which is gated by an
+    # actual mtime change, so this is essentially free CPU-wise.
+    IDLE_POLL_S = 0.04
     while True:
         try:
             mtime = os.stat(STATE_PATH).st_mtime_ns

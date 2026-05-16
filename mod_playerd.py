@@ -57,7 +57,7 @@ SEEK_STEP_S = 5
 # display's faint scrolling pattern view.
 PATTERN_WINDOW_ROWS = 17        # odd so there is a true centre row
 PATTERN_MAX_CHANNELS = 8        # truncate wide modules; first N channels only
-STATE_WRITE_THROTTLE_S = 0.1    # ~10Hz wake-rate; row changes happen at ~5-8Hz so this catches them with at most one tick of lag, and the wake-up itself is now a cheap no-op when nothing has changed
+STATE_WRITE_THROTTLE_S = 0.05   # ~20Hz wake-rate; row changes happen at ~5-10Hz and we want to detect each one within half a row, so the display scroll looks consistent. The wake itself is a cheap no-op when the row hasn't advanced (peek_position is 3 ctypes calls + a tuple compare).
 
 
 def _pick_audio_device():
