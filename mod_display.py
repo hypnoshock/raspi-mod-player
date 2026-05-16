@@ -207,7 +207,6 @@ class Renderer:
         # inside each cached tile instead of once per frame.
         self._frame = np.zeros((HEIGHT, WIDTH, 2), dtype=np.uint8)
         self._row_tile_cache = {}   # tuple[str,...] -> (H, W, 2) uint8 RGB565
-        self._row_tile_w = None     # measured on first use
 
         # Stamp caches — static (rebuilds on track change), dynamic (per
         # second tick).  Each is a list of (y, x, rgb_tile) triples.
@@ -226,14 +225,16 @@ class Renderer:
         if cached is not None:
             return cached
         text = ' '.join(cell or '...' for cell in row_tuple)
-        if self._row_tile_w is None:
-            tmp = Image.new('L', (WIDTH, PATTERN_ROW_HEIGHT), 0)
-            d = ImageDraw.Draw(tmp)
-            bbox = d.textbbox((0, 0), text, font=self.font_pattern)
-            self._row_tile_w = min(WIDTH, bbox[2] - bbox[0] + 2)
-        img = Image.new('L', (self._row_tile_w, PATTERN_ROW_HEIGHT), 0)
-        d = ImageDraw.Draw(img)
-        d.text((0, 0), text, font=self.font_pattern, fill=255)
+        # Measure for THIS row's channel count. Classic .mod is 4 channels
+        # and .xm/.it can go up to PATTERN_MAX_CHANNELS — caching a single
+        # width across all tracks would clip the wider ones into a narrower
+        # canvas. textbbox is microseconds and we only hit it on cache miss,
+        # so the cost is negligible.
+        tmp = Image.new('L', (WIDTH, PATTERN_ROW_HEIGHT), 0)
+        bbox = ImageDraw.Draw(tmp).textbbox((0, 0), text, font=self.font_pattern)
+        tile_w = min(WIDTH, bbox[2] - bbox[0] + 2)
+        img = Image.new('L', (tile_w, PATTERN_ROW_HEIGHT), 0)
+        ImageDraw.Draw(img).text((0, 0), text, font=self.font_pattern, fill=255)
         alpha = np.asarray(img, dtype=np.uint16)        # (H, W) 0..255
         # Pre-tint into RGB565 directly. This was the work we used to do per
         # frame across the whole 240x240 buffer; doing it once per unique row
@@ -242,7 +243,7 @@ class Renderer:
             sr = (alpha * c[0] // 255).astype(np.uint8)
             sg = (alpha * c[1] // 255).astype(np.uint8)
             sb = (alpha * c[2] // 255).astype(np.uint8)
-            t = np.empty((PATTERN_ROW_HEIGHT, self._row_tile_w, 2), dtype=np.uint8)
+            t = np.empty((PATTERN_ROW_HEIGHT, tile_w, 2), dtype=np.uint8)
             t[:, :, 0] = (sr & 0xF8) | (sg >> 5)
             t[:, :, 1] = ((sg & 0x1C) << 3) | (sb >> 3)
             return t
