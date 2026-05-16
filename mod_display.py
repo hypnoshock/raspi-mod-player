@@ -207,6 +207,10 @@ class Renderer:
         # inside each cached tile instead of once per frame.
         self._frame = np.zeros((HEIGHT, WIDTH, 2), dtype=np.uint8)
         self._row_tile_cache = {}   # tuple[str,...] -> (H, W, 2) uint8 RGB565
+        # Tile width keyed by channel count, so every row of a given track
+        # composites at the same pixels even when individual glyphs nudge
+        # the natural textbbox by a pixel either way.
+        self._row_tile_w_by_n = {}
 
         # Stamp caches — static (rebuilds on track change), dynamic (per
         # second tick).  Each is a list of (y, x, rgb_tile) triples.
@@ -225,14 +229,21 @@ class Renderer:
         if cached is not None:
             return cached
         text = ' '.join(cell or '...' for cell in row_tuple)
-        # Measure for THIS row's channel count. Classic .mod is 4 channels
-        # and .xm/.it can go up to PATTERN_MAX_CHANNELS — caching a single
-        # width across all tracks would clip the wider ones into a narrower
-        # canvas. textbbox is microseconds and we only hit it on cache miss,
-        # so the cost is negligible.
-        tmp = Image.new('L', (WIDTH, PATTERN_ROW_HEIGHT), 0)
-        bbox = ImageDraw.Draw(tmp).textbbox((0, 0), text, font=self.font_pattern)
-        tile_w = min(WIDTH, bbox[2] - bbox[0] + 2)
+        # Width is keyed by channel count and measured once with a worst-case
+        # 3-char placeholder (format_cell_note always returns 3-char strings
+        # like "C-5" or "---", so 'XXX' is an upper bound). All rows of the
+        # same module composite at identical pixel positions — measuring per
+        # actual row content gave ±1 px drift and a numpy broadcast error
+        # when _draw_pattern tried to fit a 208 px tile into a 207 px slot.
+        n = max(1, len(row_tuple))
+        tile_w = self._row_tile_w_by_n.get(n)
+        if tile_w is None:
+            placeholder = ' '.join('XXX' for _ in range(n))
+            tmp = Image.new('L', (WIDTH, PATTERN_ROW_HEIGHT), 0)
+            bbox = ImageDraw.Draw(tmp).textbbox(
+                (0, 0), placeholder, font=self.font_pattern)
+            tile_w = min(WIDTH, bbox[2] - bbox[0] + 2)
+            self._row_tile_w_by_n[n] = tile_w
         img = Image.new('L', (tile_w, PATTERN_ROW_HEIGHT), 0)
         ImageDraw.Draw(img).text((0, 0), text, font=self.font_pattern, fill=255)
         alpha = np.asarray(img, dtype=np.uint16)        # (H, W) 0..255
