@@ -91,7 +91,7 @@ chmod +x "$SCRIPT_DIR/modctl"
 ln -sf "$SCRIPT_DIR/modctl" /usr/local/bin/modctl
 
 echo "=> installing systemd units from services/"
-for unit in mod_playerd.service mod_display.service; do
+for unit in mod_playerd.service mod_display.service mod_player_cpu_governor.service; do
     src="$SCRIPT_DIR/services/$unit"
     if [ ! -f "$src" ]; then
         echo "missing $src — repo is incomplete"
@@ -102,6 +102,9 @@ for unit in mod_playerd.service mod_display.service; do
 done
 
 systemctl daemon-reload
+# Pin CPU clock to 1 GHz so brief lulls don't drop to 700 MHz and cause
+# audio underruns when the renderer thread has to ramp back up.
+systemctl enable --now mod_player_cpu_governor.service
 systemctl enable mod_playerd.service mod_display.service
 
 # Legacy cleanup — leftover from the xmp-based install.
