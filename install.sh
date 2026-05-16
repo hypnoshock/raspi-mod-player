@@ -65,6 +65,16 @@ if [ ! -f "$SUDOERS_FILE" ]; then
     chmod 0440 "$SUDOERS_FILE"
 fi
 
+# /tmp on tmpfs — the daemon writes /tmp/mod_state.json ~10 Hz so the
+# display sees fresh pattern data. Raspberry Pi OS doesn't tmpfs /tmp by
+# default; without this, every state write hits the SD card.
+TMPFS_LINE='tmpfs  /tmp  tmpfs  defaults,nosuid,nodev,size=64M  0  0'
+if ! grep -qE '^\s*tmpfs\s+/tmp\s' /etc/fstab; then
+    echo "=> adding tmpfs mount for /tmp to /etc/fstab (takes effect on reboot)"
+    echo "$TMPFS_LINE" >> /etc/fstab
+    NEED_REBOOT=1
+fi
+
 VENV="$REAL_HOME/mod_player/.venv"
 if [ ! -d "$VENV" ]; then
     echo "=> creating Python venv at $VENV (with system site packages)"

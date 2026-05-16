@@ -102,6 +102,7 @@ Assuming a Pi Zero W (or any Pi with SPI + USB), starting from nothing:
    - enable SPI in `/boot/firmware/config.txt` if needed
    - add your user to the `audio`, `gpio`, and `spi` groups
    - drop a `sudoers.d` entry letting your user run `mount` / `umount` without a password (for the USB floppy feature)
+   - mount `/tmp` as `tmpfs` (RAM-backed) — see "SD card longevity" below for why
    - create a Python venv at `~/mod_player/.venv` with `--system-site-packages` and pip-install `sounddevice` into it
    - write `mod_playerd.service` and `mod_display.service` to `/etc/systemd/system/` with your username baked in
    - symlink `modctl` into `/usr/local/bin/`
@@ -139,6 +140,20 @@ modctl quit          # stops the daemon (systemd will restart it)
 The display follows automatically — no separate update needed. Buttons fire the same `next` / `prev` commands internally.
 
 To plug in a USB stick formatted with tracker files, just plug it in — within ~2 seconds the daemon switches playback to its contents. Unplug to go back to `~/mod_player/mods/`.
+
+## ⚠️ SD card longevity — keep `/tmp` on tmpfs
+
+The daemon writes `/tmp/mod_state.json` roughly 10 times a second so the display can render fresh pattern/playhead data. Raspberry Pi OS Bookworm does **not** mount `/tmp` as tmpfs by default — so by default, those writes hit the SD card. That's a few hundred MB of writes per day for state that has zero reason to survive a reboot.
+
+`install.sh` mitigates this by adding a line to `/etc/fstab`:
+```
+tmpfs  /tmp  tmpfs  defaults,nosuid,nodev,size=64M  0  0
+```
+After the next reboot, `/tmp` is RAM-backed. No SD card writes from this project. If you ever clone this repo onto a new Pi and run `install.sh`, you'll get this for free; if you have an older install that pre-dates this change, just add the line manually and reboot. To check whether `/tmp` is currently tmpfs:
+```bash
+findmnt /tmp
+```
+should show `SOURCE=tmpfs`. If it shows nothing, the mount isn't active — confirm the fstab line and reboot.
 
 ## Logs and troubleshooting
 
