@@ -32,7 +32,7 @@ The daemon also exposes a **second** way to talk to it: a Unix socket (`/tmp/mod
    modctl ───▶  │  /tmp/modplayer.sock         │ ── pushes commands ──▶ playback
    (or any      │  (Unix domain socket)        │                            │
     client)     │                              │                            ▼
-                │  libopenmpt + sounddevice ──▶│ ── USB Audio CODEC ─▶ speakers
+                │  libopenmpt + sounddevice ──▶│ ── USB DAC (auto-picked) ─▶ speakers
                 │                              │
                 │  writes /tmp/mod_state.json  │ ── once a second
                 └──────────────────────────────┘
@@ -447,7 +447,7 @@ libopenmpt rendering
   sounddevice (PortAudio)
         │
         ▼
-       ALSA → USB Audio CODEC → speakers
+       ALSA → USB DAC (auto-picked) → speakers
 ```
 
 **Why the queue?** Because the audio thread must never block. If you called `read_stereo` directly inside the audio callback, any libopenmpt hiccup (track switch, GC pause, file load) would cause an audible underrun. Splitting render from playback means the audio thread can chew through the pre-rendered buffer while the renderer recovers.
@@ -456,7 +456,15 @@ libopenmpt rendering
 
 **Why ALSA direct, not PulseAudio?** Two reasons:
 - The Pi runs PipeWire-PA, which means audio is mixed across user sessions. For a single-application device with one daemon as the only producer, mixing is unnecessary overhead.
-- More importantly: PulseAudio's per-user session model fights with system-level systemd services. To talk to PA from a system service, you need to forward `PULSE_RUNTIME_PATH`, ensure the user session is active, and deal with permission edge cases. ALSA-direct just opens `hw:CARD=CODEC,DEV=0` and goes.
+- More importantly: PulseAudio's per-user session model fights with system-level systemd services. To talk to PA from a system service, you need to forward `PULSE_RUNTIME_PATH`, ensure the user session is active, and deal with permission edge cases. ALSA-direct just opens the chosen `hw:X,0` device and goes.
+
+### USB DAC selection
+
+The daemon doesn't hard-code a device name any more. At startup, `_pick_audio_device()` in `mod_playerd.py` walks `sounddevice.query_devices()`, ignores anything whose name contains `pulse`, `default`, `hdmi`, `vc4`, or `bcm2835`, and returns the index of the first output-capable device left. On a Pi Zero with one USB DAC plugged in, that's the DAC — regardless of what it calls itself.
+
+If no candidate is visible, the helper retries once a second for up to 10 seconds before raising. That window covers USB enumeration lag at boot, after which systemd's `Restart=on-failure` will pick the daemon back up if the DAC is plugged in later. There is no hot-swap recovery while the stream is open: pulling the DAC mid-playback will crash the daemon and trigger a service restart, which then re-picks whatever is currently plugged in.
+
+To swap to a different USB DAC: unplug, plug in the new one, `sudo systemctl restart mod_playerd.service`. No code edit.
 
 The flush-on-seek logic in `Player._flush_audio` is what makes seeks feel snappy:
 
@@ -580,7 +588,7 @@ If the import or setup phase fails, you'll see a Python traceback. Look for:
 - `FileNotFoundError: '.lgd-nfy-N'` — `WorkingDirectory=` is missing/wrong in the unit.
 - `RuntimeError: Failed to add edge detection` — gpiozero fell back to RPi.GPIO; ensure `GPIOZERO_PIN_FACTORY=lgpio` is being set.
 - `OSError: [Errno 98] Address already in use` on the socket — daemon died without cleanup; another instance may still be running, or `/tmp/modplayer.sock` is stale (the daemon should unlink on startup, but `pkill -f mod_playerd` and try again).
-- `PortAudioError ... No output device matching ...` — the device name in `AUDIO_DEVICE` doesn't match what's plugged in. Run `~/mod_player/.venv/bin/python -c "import sounddevice; print(sounddevice.query_devices())"` to see what PortAudio sees.
+- `RuntimeError: no USB audio output device found ...` — `_pick_audio_device()` waited 10 s and saw nothing it would route to. The message lists every device PortAudio could see; if the DAC isn't in that list it's a USB/power issue, not a code issue. If the DAC *is* listed but was filtered out, its name contains one of the skip substrings (`pulse`/`default`/`hdmi`/`vc4`/`bcm2835`) — add a more specific exclusion or rename the skip list.
 
 ### Debugging "the display won't update"
 

@@ -41,7 +41,6 @@ SAMPLERATE = 44100
 FRAMES_PER_CHUNK = 1024
 CHANNELS = 2
 AUDIO_QUEUE_DEPTH = 4
-AUDIO_DEVICE = 'USB Audio CODEC'
 
 STATE_PATH = '/tmp/mod_state.json'
 SOCKET_PATH = '/tmp/modplayer.sock'
@@ -59,6 +58,32 @@ SEEK_STEP_S = 5
 PATTERN_WINDOW_ROWS = 17        # odd so there is a true centre row
 PATTERN_MAX_CHANNELS = 6        # truncate wide modules; first N channels only
 STATE_WRITE_THROTTLE_S = 0.05   # target ~20Hz state writes for smooth pattern scroll
+
+
+def _pick_audio_device():
+    """Return the sounddevice index of the first plausible USB DAC.
+
+    Filters out PortAudio's pulse/default virtuals and on-board HDMI, then
+    picks the first remaining output-capable device. Retries for a few
+    seconds because USB enumeration can lag systemd start at boot.
+    """
+    skip_substrings = ('pulse', 'default', 'hdmi', 'vc4', 'bcm2835')
+    deadline = time.monotonic() + 10.0
+    while True:
+        for idx, dev in enumerate(sd.query_devices()):
+            if dev['max_output_channels'] < CHANNELS:
+                continue
+            name = dev['name'].lower()
+            if any(s in name for s in skip_substrings):
+                continue
+            print(f'[player] audio device: {dev["name"]!r} (index {idx})',
+                  file=sys.stderr)
+            return idx
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                'no USB audio output device found; devices visible: '
+                + ', '.join(repr(d['name']) for d in sd.query_devices()))
+        time.sleep(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +117,7 @@ class Player:
         self._stream = sd.RawOutputStream(
             samplerate=SAMPLERATE,
             blocksize=FRAMES_PER_CHUNK,
-            device=AUDIO_DEVICE,
+            device=_pick_audio_device(),
             channels=CHANNELS,
             dtype='int16',
         )
