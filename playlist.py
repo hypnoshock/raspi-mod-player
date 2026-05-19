@@ -9,7 +9,7 @@ import os
 import random
 import subprocess
 
-EXTS = {'.mod', '.xm', '.s3m', '.it'}
+EXTS = {'.mod', '.xm', '.s3m', '.it', '.mptm', '.mtm', '.mo3', '.mt2', '.med', '.ams', '.dbm', '.dmf', '.dtm', '.ult', '.symmod', '.okt'}
 
 FLOPPY_MOUNT = os.path.expanduser('~/floppy')
 FALLBACK_DIR = os.path.expanduser('~/mod_player/mods')

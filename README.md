@@ -1,8 +1,29 @@
 # mod_player
 
-A self-contained tracker-module music player for a Raspberry Pi. Plays `.mod` / `.xm` / `.it` / `.s3m` files through a USB audio DAC, shows the current track on a small SPI display, and accepts next/prev/seek commands from GPIO buttons, SSH, or (eventually) a web UI.
+A self-contained tracker-module music player for a Raspberry Pi. Plays tracker module files through a USB audio DAC, shows the current track on a small SPI display, and accepts next/prev/seek commands from GPIO buttons, SSH, or (eventually) a web UI.
 
 Built around `libopenmpt` directly — no CLI player, no screen-scraping, no virtual keyboard tricks.
+
+## Supported formats
+
+| Extension | Format |
+|-----------|--------|
+| .mod | ProTracker MOD |
+| .xm | FastTracker 2 Extended Module |
+| .it | Impulse Tracker |
+| .s3m | Scream Tracker 3 |
+| .mptm | OpenMPT |
+| .mtm | MultiTracker |
+| .mo3 | MO3 (compressed module with MP3/Ogg samples) |
+| .mt2 | MadTracker 2 |
+| .med | OctaMED |
+| .ams | Extreme's Tracker / Velvet Studio |
+| .dbm | Digi Booster Pro |
+| .dmf | ASYLUM Music Format / X-Tracker |
+| .dtm | Digital Tracker / Digital Home Studio |
+| .ult | UltraTracker |
+| .symmod | Symphonie / Symphonie Pro |
+| .okt | Oktalyzer |
 
 ## Hardware
 
